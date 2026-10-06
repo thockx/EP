@@ -9,6 +9,12 @@ Run:  python photon_gui.py      (NumPy, Matplotlib, and Tkinter required)
   be meaningless if they changed mid-run).
 * Display options (components, error bars, band, y-scale, convergence panel) change live.
 * Click on the histogram (toolbar in zoom/pan off) to pick the bin shown in the convergence panel.
+* The "Scattering" tab reuses the Mie/Rayleigh scattering-to-lens model from
+  scattering_to_lens_v2.py (needs `pip install miepython` for the fog_mie medium) to estimate how
+  many photons/s a laser beam scatters into the lens. Tick "Compute signal rate from scattering
+  model" on the Physics tab to drive the simulation's signal rate from that estimate (photons/s
+  into the lens x SPDE, the single-photon detection efficiency); untick it to set the signal rate
+  manually as before.
 """
 import time
 import heapq
@@ -21,6 +27,8 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.collections import LineCollection
+
+import scattering_to_lens_v2 as scat
 
 # Experiment and detector defaults
 DEFAULT_T_RUN = 50e-9
@@ -35,6 +43,37 @@ DEFAULT_T_CENTER = 20e-9
 DEFAULT_A = 1e9
 DEFAULT_GAUSSIAN_SIGMA = 5e-9
 DEFAULT_SIGNAL_RATE_MODE = "Peak"
+
+# Mie/Rayleigh scattering-to-lens defaults (mirrors scattering_to_lens_v2.py SETTINGS)
+DEFAULT_SPDE = 0.3  # single-photon detection efficiency, multiplied into the computed signal rate
+DEFAULT_USE_SCATTERING_RATE = False
+DEFAULT_SCATTER_WAVELENGTH_NM = scat.WAVELENGTH_NM
+DEFAULT_SCATTER_POWER_W = scat.POWER_W
+DEFAULT_SCATTER_POWER_MODE = scat.POWER_MODE
+DEFAULT_SCATTER_PULSE_LENGTH_S = scat.PULSE_LENGTH_S
+DEFAULT_SCATTER_REP_RATE_HZ = scat.REP_RATE_HZ
+DEFAULT_SCATTER_LENS_DIAMETER_M = scat.LENS_DIAMETER_M
+DEFAULT_SCATTER_DISTANCE_M = scat.DISTANCE_M
+DEFAULT_SCATTER_SOLID_ANGLE_SR = scat.SOLID_ANGLE_SR
+DEFAULT_SCATTER_LASER_DISTANCE_M = scat.LASER_DISTANCE_M
+DEFAULT_SCATTER_FOV_DEG = scat.FOV_DEG
+DEFAULT_SCATTER_HORIZONTAL_RESOLUTION = scat.HORIZONTAL_RESOLUTION
+DEFAULT_SCATTER_VIEWED_BEAM_LENGTH_M = scat.VIEWED_BEAM_LENGTH_M
+DEFAULT_SCATTER_POLARIZATION = scat.POLARIZATION
+DEFAULT_SCATTER_MEDIUM = scat.MEDIUM
+DEFAULT_SCATTER_TEMPERATURE_K = scat.TEMPERATURE_K
+DEFAULT_SCATTER_PRESSURE_PA = scat.PRESSURE_PA
+DEFAULT_SCATTER_FOG_VISIBILITY_M = scat.FOG_VISIBILITY_M
+DEFAULT_SCATTER_FOG_G = scat.FOG_G
+DEFAULT_SCATTER_FOG_MODE_RADIUS_UM = scat.FOG_MODE_RADIUS_UM
+DEFAULT_SCATTER_FOG_ALPHA = scat.FOG_ALPHA
+DEFAULT_SCATTER_WATER_N = scat.WATER_REFRACTIVE_INDEX.real
+DEFAULT_SCATTER_WATER_K = -scat.WATER_REFRACTIVE_INDEX.imag
+DEFAULT_SCATTER_MIE_N_RADII = scat.MIE_N_RADII
+DEFAULT_SCATTER_MIE_N_ANGLES = scat.MIE_N_ANGLES
+
+SPDE = DEFAULT_SPDE
+USE_SCATTERING_RATE = DEFAULT_USE_SCATTERING_RATE
 T_RUN = DEFAULT_T_RUN
 BIN_WIDTH = DEFAULT_BIN_WIDTH
 MAX_RUNS = 1_000_000
@@ -353,19 +392,86 @@ class App:
         self.vars[name] = v
         return v
 
-    def _entry_row(self, parent, label, name, default):
+    def _entry_row(self, parent, label, name, default, width=11):
         r = ttk.Frame(parent)
         r.pack(fill="x", pady=1)
         ttk.Label(r, text=label, width=26).pack(side="left")
-        ttk.Entry(r, textvariable=self._var(name, str(default)), width=11).pack(side="right")
+        entry = ttk.Entry(r, textvariable=self._var(name, str(default)), width=width)
+        entry.pack(side="right")
+        return entry
+
+    def _optional_entry_row(self, parent, label, name, default):
+        """Entry row for a setting that may be None (blank = auto / override off)."""
+        return self._entry_row(parent, label, name, "" if default is None else str(default))
+
+    def _combo_row(self, parent, label, name, default, values, command=None):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=1)
+        ttk.Label(r, text=label, width=26).pack(side="left")
+        self._var(name, default)
+        cb = ttk.Combobox(r, textvariable=self.vars[name], values=values, state="readonly", width=16)
+        cb.pack(side="right")
+        if command is not None:
+            cb.bind("<<ComboboxSelected>>", lambda e: command())
+        return cb
 
     def _check(self, parent, label, name, default, command=None):
         v = self._var(name, default, tk.BooleanVar)
         ttk.Checkbutton(parent, text=label, variable=v, command=command).pack(anchor="w")
 
+    def _on_toggle_scattering_rate(self):
+        """Grey out the manual signal-rate entry while the scattering model drives it."""
+        use_scattering = self.vars["use_scattering_rate"].get()
+        self.signal_rate_entry.config(state="disabled" if use_scattering else "normal")
+
+    def _build_scrollable_sidebar(self):
+        """Wrap the left control sidebar in a vertically scrollable canvas so a tall tab
+        (e.g. Scattering) cannot push the pixel-preview/run-control sections off screen."""
+        outer = ttk.Frame(self.root)
+        outer.pack(side="left", fill="y")
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="y", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        left = ttk.Frame(canvas, padding=6)
+        window_id = canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _sync_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"), width=left.winfo_reqwidth())
+        left.bind("<Configure>", _sync_scroll_region)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return left
+
+    def _scrollable_tab(self, notebook, title):
+        """Add a notebook tab whose content scrolls internally if it doesn't fit the
+        notebook's (fixed) height, instead of growing the notebook itself."""
+        page = ttk.Frame(notebook)
+        notebook.add(page, text=title)
+        canvas = tk.Canvas(page, highlightthickness=0)
+        vsb = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas, padding=4)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return inner
+
     def _build_ui(self):
-        left = ttk.Frame(self.root, padding=6)
-        left.pack(side="left", fill="y")
+        left = self._build_scrollable_sidebar()
         center = ttk.Frame(self.root)
         center.pack(side="left", fill="both", expand=True)
         right = ttk.Frame(self.root, padding=6)
@@ -373,15 +479,16 @@ class App:
 
         nb = ttk.Notebook(left)
         nb.pack(fill="x")
-        phys, det, disp = (ttk.Frame(nb, padding=6) for _ in range(3))
-        nb.add(phys, text="Physics")
-        nb.add(det, text="Detector")
-        nb.add(disp, text="Display")
+        phys, scatter, det, disp = (self._scrollable_tab(nb, title) for title in
+                                    ("Physics", "Scattering", "Detector", "Display"))
 
         # ---- physics ----
         signal_box = ttk.LabelFrame(phys, text="Signal detection", padding=4)
         signal_box.pack(fill="x")
-        self._entry_row(signal_box, "Signal rate [MHz]", "signal_rate_mhz", sim.SIGNAL_RATE_HZ / 1e6)
+        self._check(signal_box, "Compute signal rate from scattering model (Scattering tab)",
+                    "use_scattering_rate", sim.USE_SCATTERING_RATE, self._on_toggle_scattering_rate)
+        self.signal_rate_entry = self._entry_row(
+            signal_box, "Signal rate [MHz]", "signal_rate_mhz", sim.SIGNAL_RATE_HZ / 1e6)
         row = ttk.Frame(signal_box)
         row.pack(fill="x", pady=1)
         ttk.Label(row, text="Rate interpretation", width=26).pack(side="left")
@@ -410,6 +517,73 @@ class App:
         self._entry_row(general, "Random seed", "seed", sim.RANDOM_SEED)
         self._entry_row(general, "Window size [ns]", "window_ns", sim.T_RUN * 1e9)
         self._entry_row(general, "Bin size [ps]", "bin_ps", sim.BIN_WIDTH * 1e12)
+
+        # ---- scattering (Mie/Rayleigh scattering-to-lens model, from scattering_to_lens_v2.py) ----
+        spde_box = ttk.LabelFrame(scatter, text="Detection efficiency", padding=4)
+        spde_box.pack(fill="x")
+        self._entry_row(spde_box, "SPDE (0-1)", "spde", sim.SPDE)
+
+        laser_box = ttk.LabelFrame(scatter, text="Laser / beam", padding=4)
+        laser_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(laser_box, "Wavelength [nm]", "sc_wavelength_nm", sim.DEFAULT_SCATTER_WAVELENGTH_NM)
+        self._entry_row(laser_box, "Power [mW]", "sc_power_mw", sim.DEFAULT_SCATTER_POWER_W * 1e3)
+        self._combo_row(laser_box, "Power mode", "sc_power_mode", sim.DEFAULT_SCATTER_POWER_MODE.capitalize(),
+                        ("Peak", "Average"))
+        self._entry_row(laser_box, "Pulse length [ns] (peak)", "sc_pulse_length_ns",
+                        sim.DEFAULT_SCATTER_PULSE_LENGTH_S * 1e9)
+        self._entry_row(laser_box, "Rep rate [MHz] (average)", "sc_rep_rate_mhz",
+                        sim.DEFAULT_SCATTER_REP_RATE_HZ / 1e6)
+        self._entry_row(laser_box, "Laser distance [m]", "sc_laser_distance_m", sim.DEFAULT_SCATTER_LASER_DISTANCE_M)
+
+        lens_box = ttk.LabelFrame(scatter, text="Lens / geometry", padding=4)
+        lens_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(lens_box, "Lens diameter [mm]", "sc_lens_diameter_mm", sim.DEFAULT_SCATTER_LENS_DIAMETER_M * 1e3)
+        self._entry_row(lens_box, "Distance to beam [m]", "sc_distance_m", sim.DEFAULT_SCATTER_DISTANCE_M)
+        self._optional_entry_row(lens_box, "Solid angle override [sr]", "sc_solid_angle_sr",
+                                 sim.DEFAULT_SCATTER_SOLID_ANGLE_SR)
+
+        fov_box = ttk.LabelFrame(scatter, text="Field of view", padding=4)
+        fov_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(fov_box, "FOV [deg]", "sc_fov_deg", sim.DEFAULT_SCATTER_FOV_DEG)
+        self._entry_row(fov_box, "Horizontal resolution", "sc_horizontal_resolution",
+                        sim.DEFAULT_SCATTER_HORIZONTAL_RESOLUTION)
+        self._optional_entry_row(fov_box, "Viewed beam length override [mm]", "sc_viewed_beam_length_mm",
+                                 sim.DEFAULT_SCATTER_VIEWED_BEAM_LENGTH_M)
+
+        medium_box = ttk.LabelFrame(scatter, text="Medium & polarization", padding=4)
+        medium_box.pack(fill="x", pady=(4, 0))
+        self._combo_row(medium_box, "Medium", "sc_medium", sim.DEFAULT_SCATTER_MEDIUM,
+                        ("air", "fog_mie", "fog_hg"))
+        self._combo_row(medium_box, "Polarization", "sc_polarization", sim.DEFAULT_SCATTER_POLARIZATION,
+                        ("perpendicular", "in_plane", "unpolarized"))
+
+        air_box = ttk.LabelFrame(scatter, text="Air (medium = air)", padding=4)
+        air_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(air_box, "Temperature [K]", "sc_temperature_k", sim.DEFAULT_SCATTER_TEMPERATURE_K)
+        self._entry_row(air_box, "Pressure [Pa]", "sc_pressure_pa", sim.DEFAULT_SCATTER_PRESSURE_PA)
+
+        fog_box = ttk.LabelFrame(scatter, text="Fog (both fog models)", padding=4)
+        fog_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(fog_box, "Visibility [m]", "sc_fog_visibility_m", sim.DEFAULT_SCATTER_FOG_VISIBILITY_M)
+        self._entry_row(fog_box, "Henyey-Greenstein g (fog_hg)", "sc_fog_g", sim.DEFAULT_SCATTER_FOG_G)
+
+        mie_box = ttk.LabelFrame(scatter, text="Mie droplets (medium = fog_mie)", padding=4)
+        mie_box.pack(fill="x", pady=(4, 0))
+        self._entry_row(mie_box, "Mode radius [um]", "sc_fog_mode_radius_um", sim.DEFAULT_SCATTER_FOG_MODE_RADIUS_UM)
+        self._entry_row(mie_box, "Alpha (distribution shape)", "sc_fog_alpha", sim.DEFAULT_SCATTER_FOG_ALPHA)
+        self._entry_row(mie_box, "Water refractive index n", "sc_water_n", sim.DEFAULT_SCATTER_WATER_N)
+        self._entry_row(mie_box, "Water refractive index k (absorption)", "sc_water_k", sim.DEFAULT_SCATTER_WATER_K)
+        self._entry_row(mie_box, "Mie radii samples", "sc_mie_n_radii", sim.DEFAULT_SCATTER_MIE_N_RADII)
+        self._entry_row(mie_box, "Mie angle samples", "sc_mie_n_angles", sim.DEFAULT_SCATTER_MIE_N_ANGLES)
+
+        result_box = ttk.LabelFrame(scatter, text="Last computed result", padding=4)
+        result_box.pack(fill="x", pady=(4, 0))
+        self.scatter_info = ttk.Label(result_box, text="(enable the checkbox on the Physics tab and "
+                                      "Apply & Restart to compute)", font=("Consolas", 8), justify="left",
+                                      wraplength=240)
+        self.scatter_info.pack(anchor="w")
+
+        self._on_toggle_scattering_rate()
 
         # ---- detector ----
         self._check(det, "Dark counts", "dark", sim.ENABLE_DARK_COUNTS)
@@ -459,6 +633,13 @@ class App:
         ttk.Entry(r, textvariable=self._var("bin_ns", f"{self.sel_bin * sim.BIN_WIDTH * 1e9:.3f}"),
                   width=9).pack(side="right")
         ttk.Button(disp, text="Set bin", command=self._set_bin_from_entry).pack(anchor="e")
+
+        # Fix the notebook's height to the typical (non-Scattering) tab size: without this,
+        # ttk.Notebook sizes itself to the tallest tab, leaving a big gap below short tabs.
+        # The Scattering tab's own scrollbar (added in _scrollable_tab) handles its overflow.
+        self.root.update_idletasks()
+        short_tab_heights = [frame.winfo_reqheight() for frame in (phys, det, disp)]
+        nb.configure(height=max(short_tab_heights, default=400))
 
         # Shared pixel settings sit outside the tab pages so they remain accessible.
         pv = ttk.LabelFrame(left, text="Pixel view settings", padding=6)
@@ -519,6 +700,93 @@ class App:
             raise ValueError(f"{name} must be in [{lo}, {hi}]")
         return x
 
+    def _optional_num(self, name, lo=None, hi=None):
+        """Like _num, but a blank entry means 'no override' (None)."""
+        txt = self.vars[name].get().strip()
+        if txt == "":
+            return None
+        try:
+            x = float(txt)
+        except ValueError:
+            raise ValueError(f"'{txt}' is not a valid number for {name}")
+        if not np.isfinite(x):
+            raise ValueError(f"{name} must be finite")
+        if (lo is not None and x < lo) or (hi is not None and x > hi):
+            raise ValueError(f"{name} must be in [{lo}, {hi}]")
+        return x
+
+    def _compute_scattering_rate(self):
+        """Apply the Scattering-tab settings to scattering_to_lens_v2.py's model and
+        return the detected signal rate [Hz] = (photons/s into the lens) x SPDE."""
+        spde = self._num("spde", 0.0, 1.0)
+        power_mode = self.vars["sc_power_mode"].get().lower()
+        if power_mode not in ("peak", "average"):
+            raise ValueError("Power mode must be Peak or Average")
+        medium = self.vars["sc_medium"].get()
+        polarization = self.vars["sc_polarization"].get()
+        if medium not in scat.VALID_MEDIA:
+            raise ValueError(f"Medium must be one of {scat.VALID_MEDIA}")
+        if polarization not in scat.VALID_POLARIZATIONS:
+            raise ValueError(f"Polarization must be one of {scat.VALID_POLARIZATIONS}")
+
+        scat.WAVELENGTH_NM = self._num("sc_wavelength_nm", 1.0)
+        scat.POWER_W = self._num("sc_power_mw", 0.0) * 1e-3
+        scat.POWER_MODE = power_mode
+        scat.PULSE_LENGTH_S = self._num("sc_pulse_length_ns", 1e-6) * 1e-9
+        scat.REP_RATE_HZ = self._num("sc_rep_rate_mhz", 1e-6) * 1e6
+        scat.LENS_DIAMETER_M = self._num("sc_lens_diameter_mm", 1e-6) * 1e-3
+        scat.DISTANCE_M = self._num("sc_distance_m", 1e-6)
+        scat.SOLID_ANGLE_SR = self._optional_num("sc_solid_angle_sr", 0.0)
+        scat.LASER_DISTANCE_M = self._num("sc_laser_distance_m", 0.0)
+        scat.FOV_DEG = self._num("sc_fov_deg", 1e-6, 360.0)
+        scat.HORIZONTAL_RESOLUTION = self._num("sc_horizontal_resolution", 1, None, integer=True)
+        viewed_len_mm = self._optional_num("sc_viewed_beam_length_mm", 0.0)
+        scat.VIEWED_BEAM_LENGTH_M = None if viewed_len_mm is None else viewed_len_mm * 1e-3
+        scat.POLARIZATION = polarization
+        scat.MEDIUM = medium
+        scat.TEMPERATURE_K = self._num("sc_temperature_k", 1.0)
+        scat.PRESSURE_PA = self._num("sc_pressure_pa", 0.0)
+        scat.FOG_VISIBILITY_M = self._num("sc_fog_visibility_m", 1e-6)
+        scat.FOG_G = self._num("sc_fog_g", -0.999, 0.999)
+        scat.FOG_MODE_RADIUS_UM = self._num("sc_fog_mode_radius_um", 1e-6)
+        scat.FOG_ALPHA = self._num("sc_fog_alpha", 1e-6)
+        water_n = self._num("sc_water_n", 1.0)
+        water_k = self._num("sc_water_k", 0.0)
+        scat.WATER_REFRACTIVE_INDEX = complex(water_n, -water_k)
+        scat.MIE_N_RADII = self._num("sc_mie_n_radii", 2, 100000, integer=True)
+        scat.MIE_N_ANGLES = self._num("sc_mie_n_angles", 3, 1_000_000, integer=True)
+
+        try:
+            scat.validate_settings()
+        except ValueError as e:
+            raise ValueError(f"Scattering settings: {e}")
+
+        lam = scat.WAVELENGTH_NM * 1e-9
+        n_dot = scat.photon_rate(scat.POWER_W, lam)
+        try:
+            mie = scat.MieFog() if scat.MEDIUM == "fog_mie" else None
+        except ImportError as e:
+            raise ValueError(str(e))
+        res = scat.fraction_into_lens(mie)
+        frac = res["fraction"]
+        photons_into_lens_per_s = n_dot * frac
+        detected_rate_hz = photons_into_lens_per_s * spde
+
+        sim.SPDE = spde
+        info_lines = [
+            f"Medium: {scat.MEDIUM}   polarization: {scat.POLARIZATION}",
+            f"beta_ext: {res['beta']:.3e} 1/m   tau: {res['tau_path']:.3g}",
+            f"Beam photons: {n_dot:.3e} /s",
+            f"Fraction into lens: {frac:.3e}",
+            f"Photons into lens (pre-SPDE): {photons_into_lens_per_s:.3e} /s",
+            f"SPDE: {spde:.3g}",
+            f"Detected signal rate: {detected_rate_hz / 1e6:.4g} MHz",
+        ]
+        if res["tau_path"] > 0.3:
+            info_lines.append("WARNING: tau > 0.3, multiple scattering not negligible.")
+        self.scatter_info.config(text="\n".join(info_lines))
+        return detected_rate_hz
+
     def reset_defaults(self):
         defaults = {
             "signal_rate_mhz": sim.DEFAULT_SIGNAL_RATE_HZ / 1e6,
@@ -538,6 +806,32 @@ class App:
             "bin_ps": sim.DEFAULT_BIN_WIDTH * 1e12,
             "pix_fps": 30,
             "pix_bps": 200,
+            "spde": sim.DEFAULT_SPDE,
+            "sc_wavelength_nm": sim.DEFAULT_SCATTER_WAVELENGTH_NM,
+            "sc_power_mw": sim.DEFAULT_SCATTER_POWER_W * 1e3,
+            "sc_power_mode": sim.DEFAULT_SCATTER_POWER_MODE.capitalize(),
+            "sc_pulse_length_ns": sim.DEFAULT_SCATTER_PULSE_LENGTH_S * 1e9,
+            "sc_rep_rate_mhz": sim.DEFAULT_SCATTER_REP_RATE_HZ / 1e6,
+            "sc_laser_distance_m": sim.DEFAULT_SCATTER_LASER_DISTANCE_M,
+            "sc_lens_diameter_mm": sim.DEFAULT_SCATTER_LENS_DIAMETER_M * 1e3,
+            "sc_distance_m": sim.DEFAULT_SCATTER_DISTANCE_M,
+            "sc_solid_angle_sr": "" if sim.DEFAULT_SCATTER_SOLID_ANGLE_SR is None else sim.DEFAULT_SCATTER_SOLID_ANGLE_SR,
+            "sc_fov_deg": sim.DEFAULT_SCATTER_FOV_DEG,
+            "sc_horizontal_resolution": sim.DEFAULT_SCATTER_HORIZONTAL_RESOLUTION,
+            "sc_viewed_beam_length_mm": ("" if sim.DEFAULT_SCATTER_VIEWED_BEAM_LENGTH_M is None
+                                        else sim.DEFAULT_SCATTER_VIEWED_BEAM_LENGTH_M * 1e3),
+            "sc_medium": sim.DEFAULT_SCATTER_MEDIUM,
+            "sc_polarization": sim.DEFAULT_SCATTER_POLARIZATION,
+            "sc_temperature_k": sim.DEFAULT_SCATTER_TEMPERATURE_K,
+            "sc_pressure_pa": sim.DEFAULT_SCATTER_PRESSURE_PA,
+            "sc_fog_visibility_m": sim.DEFAULT_SCATTER_FOG_VISIBILITY_M,
+            "sc_fog_g": sim.DEFAULT_SCATTER_FOG_G,
+            "sc_fog_mode_radius_um": sim.DEFAULT_SCATTER_FOG_MODE_RADIUS_UM,
+            "sc_fog_alpha": sim.DEFAULT_SCATTER_FOG_ALPHA,
+            "sc_water_n": sim.DEFAULT_SCATTER_WATER_N,
+            "sc_water_k": sim.DEFAULT_SCATTER_WATER_K,
+            "sc_mie_n_radii": sim.DEFAULT_SCATTER_MIE_N_RADII,
+            "sc_mie_n_angles": sim.DEFAULT_SCATTER_MIE_N_ANGLES,
         }
         for key, value in defaults.items():
             self.vars[key].set(str(value))
@@ -554,6 +848,7 @@ class App:
             "show_noise": sim.SHOW_NOISE_COMPONENT,
             "show_dark": sim.SHOW_DARK_COMPONENT,
             "show_afterpulse": sim.SHOW_AP_COMPONENT,
+            "use_scattering_rate": sim.DEFAULT_USE_SCATTERING_RATE,
         }
         for key, value in switches.items():
             self.vars[key].set(value)
@@ -561,12 +856,18 @@ class App:
         self.vars["deadtime_estimate"].set(sim.SHOW_DEADTIME_ESTIMATE)
         self.vars["conv"].set(False)
         self.speed.set(1.6)
+        self._on_toggle_scattering_rate()
 
     def _apply_parameters(self):
         signal_rate = self._num("signal_rate_mhz", 0.0) * 1e6
         signal_rate_mode = self.vars["signal_rate_mode"].get()
         if signal_rate_mode not in ("Peak", "Average"):
             raise ValueError("Signal rate interpretation must be Peak or Average")
+        use_scattering_rate = self.vars["use_scattering_rate"].get()
+        if use_scattering_rate:
+            signal_rate = self._compute_scattering_rate()
+            self.vars["signal_rate_mhz"].set(f"{signal_rate / 1e6:.6g}")
+        sim.USE_SCATTERING_RATE = use_scattering_rate
         noise_rate = self._num("noise_rate_mhz", 0.0) * 1e6
         window_seconds = self._num("window_ns", 1e-6, 1e9) * 1e-9
         bin_width = self._num("bin_ps", 1e-3, 1e9) * 1e-12
@@ -615,10 +916,15 @@ class App:
 
     # ---------------------------------------------------------- simulation
     def restart(self):
+        if (self.vars.get("use_scattering_rate") is not None and self.vars["use_scattering_rate"].get()
+                and self.vars["sc_medium"].get() == "fog_mie"):
+            self.status.config(text="Computing Mie scattering model (can take up to a minute)...")
+            self.root.update_idletasks()
         try:
             cfg, max_runs, seed = self._apply_parameters()
         except ValueError as e:
             messagebox.showerror("Invalid parameter", str(e))
+            self.status.config(text="")
             return
         self.cfg, self.max_runs = cfg, max_runs
         self.probs = sim.expected_bin_probabilities(cfg)
