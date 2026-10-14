@@ -1,6 +1,6 @@
 ## Simulation
 
-To investigate the behavior of the detector system and visualize the effects of different experimental parameters, we developed a Python simulation (photon_gui.py). Note that AI was used in coding this simulation.
+To investigate the behavior of the detector system and visualize the effects of different experimental parameters, we developed a Python simulation (photon_gui.py). Note that due to time constraints, AI was used heavily in coding this simulation. Therefore, this simulation should only serve as a rough estimate, not a definitive model.
 
 ### Signal and laser
 
